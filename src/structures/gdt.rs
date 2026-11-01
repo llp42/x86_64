@@ -79,6 +79,11 @@ impl fmt::Debug for Entry {
 /// internally. This means you can add up to `MAX - 1` additional [`Entry`]s to
 /// this table. Note that some [`Descriptor`]s may take up 2 [`Entry`]s.
 ///
+/// For a fixed layout, start from a table of the length you want, such as
+/// [`GlobalDescriptorTable::from_raw_entries(&[0; N])`](GlobalDescriptorTable::from_raw_entries),
+/// and write each [`Descriptor`] at its index with [`GlobalDescriptorTable::set`], or with
+/// [`GlobalDescriptorTable::store`] once the table may be loaded.
+///
 /// Data segment registers in ring 0 can be loaded with the null segment selector. When running in
 /// ring 3, the `ss` register must point to a valid data segment which can be obtained through the
 /// [`Descriptor::user_data_segment()`](Descriptor::user_data_segment) function. Code segments must
@@ -105,6 +110,10 @@ impl fmt::Debug for Entry {
 /// ```
 
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    not(all(feature = "instructions", target_arch = "x86_64")),
+    allow(rustdoc::broken_intra_doc_links)
+)]
 pub struct GlobalDescriptorTable<const MAX: usize = 8> {
     table: [Entry; MAX],
     len: usize,
@@ -213,6 +222,84 @@ impl<const MAX: usize> GlobalDescriptorTable<MAX> {
         SegmentSelector::new(index as u16, entry.dpl())
     }
 
+    /// Writes the given segment descriptor at `index`, returning its segment selector.
+    ///
+    /// Unlike [`append`](Self::append), this does not grow the table: the descriptor, which takes
+    /// two [`Entry`]s if it is a [`SystemSegment`](Descriptor::SystemSegment), must lie within
+    /// [`entries`](Self::entries). Starting from a table of the length you want, this builds a
+    /// fixed layout:
+    ///
+    /// ```
+    /// use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable};
+    ///
+    /// let mut gdt = GlobalDescriptorTable::<8>::from_raw_entries(&[0; 8]);
+    /// let data = gdt.set(2, Descriptor::kernel_data_segment());
+    /// assert_eq!(data.index(), 2);
+    /// assert_eq!(gdt.entries()[1].raw(), 0);
+    /// assert_eq!(gdt.entries().len(), 8);
+    /// ```
+    ///
+    /// Panics if `index` is 0, the null descriptor, or if the descriptor does not fit in the
+    /// table.
+    #[inline]
+    pub const fn set(&mut self, index: usize, entry: Descriptor) -> SegmentSelector {
+        match entry {
+            Descriptor::UserSegment(value) => {
+                self.check_slot(index, 1);
+                self.table[index] = Entry::new(value);
+            }
+            Descriptor::SystemSegment(value_low, value_high) => {
+                self.check_slot(index, 2);
+                self.table[index] = Entry::new(value_low);
+                self.table[index + 1] = Entry::new(value_high);
+            }
+        }
+        SegmentSelector::new(index as u16, entry.dpl())
+    }
+
+    /// Writes the given segment descriptor at `index` of a table the CPU may have loaded,
+    /// returning its segment selector.
+    ///
+    /// This is [`set`](Self::set) through a shared reference, for changes after
+    /// [`load`](Self::load), such as a TSS or thread-local segments. The two [`Entry`]s of a
+    /// [`SystemSegment`](Descriptor::SystemSegment) are not written atomically together.
+    ///
+    /// Panics if `index` is 0, the null descriptor, or if the descriptor does not fit in the
+    /// table.
+    ///
+    /// # Safety
+    ///
+    /// While the entries change, no segment register or task register is loaded from them, and
+    /// none loaded from them before relies on their old value (an interrupt return reloads `cs`
+    /// and `ss`, for example).
+    #[cfg(all(feature = "instructions", target_arch = "x86_64"))]
+    #[inline]
+    pub unsafe fn store(&self, index: usize, entry: Descriptor) -> SegmentSelector {
+        match entry {
+            Descriptor::UserSegment(value) => {
+                self.check_slot(index, 1);
+                self.table[index].0.store(value, Ordering::SeqCst);
+            }
+            Descriptor::SystemSegment(value_low, value_high) => {
+                self.check_slot(index, 2);
+                self.table[index + 1].0.store(value_high, Ordering::SeqCst);
+                self.table[index].0.store(value_low, Ordering::SeqCst);
+            }
+        }
+        SegmentSelector::new(index as u16, entry.dpl())
+    }
+
+    /// Panics unless `size` entries fit at `index`, past the null descriptor.
+    #[inline]
+    const fn check_slot(&self, index: usize, size: usize) {
+        if index == 0 {
+            panic!("cannot overwrite the null descriptor")
+        }
+        if index >= self.len || size > self.len - index {
+            panic!("descriptor does not fit in the GDT")
+        }
+    }
+
     /// Loads the GDT in the CPU using the `lgdt` instruction. This does **not** alter any of the
     /// segment registers; you **must** (re)load them yourself using [the appropriate
     /// functions](crate::instructions::segmentation):
@@ -220,7 +307,8 @@ impl<const MAX: usize> GlobalDescriptorTable<MAX> {
     #[cfg(all(feature = "instructions", target_arch = "x86_64"))]
     #[inline]
     pub fn load(&'static self) {
-        // SAFETY: static lifetime ensures no modification after loading.
+        // SAFETY: static lifetime ensures the table outlives its use, and after loading it only
+        // changes through the unsafe `store`.
         unsafe { self.load_unsafe() };
     }
 
@@ -233,7 +321,8 @@ impl<const MAX: usize> GlobalDescriptorTable<MAX> {
     ///
     /// Unlike `load` this function will not impose a static lifetime constraint
     /// this means its up to the user to ensure that there will be no modifications
-    /// after loading and that the GDT will live for as long as it's loaded.
+    /// after loading, other than through [`store`](Self::store), and that the GDT will
+    /// live for as long as it's loaded.
     ///
     #[cfg(all(feature = "instructions", target_arch = "x86_64"))]
     #[inline]
@@ -596,6 +685,104 @@ mod tests {
         gdt.append(Descriptor::user_data_segment());
         // We have one free slot, but the GDT requires two
         gdt.append(Descriptor::tss_segment(&TSS));
+    }
+
+    // Makes a GDT of eight empty entries
+    fn make_empty_gdt() -> GlobalDescriptorTable {
+        GlobalDescriptorTable::from_raw_entries(&[0; 8])
+    }
+
+    #[test]
+    pub fn set_in_place() {
+        let mut gdt = make_empty_gdt();
+        let data = gdt.set(2, Descriptor::kernel_data_segment());
+        let code = gdt.set(5, Descriptor::user_code_segment());
+        assert_eq!(data, SegmentSelector::new(2, PrivilegeLevel::Ring0));
+        assert_eq!(code, SegmentSelector::new(5, PrivilegeLevel::Ring3));
+        let raw: [u64; 8] = core::array::from_fn(|i| gdt.entries()[i].raw());
+        assert_eq!(
+            raw,
+            [
+                0,
+                0,
+                Flags::KERNEL_DATA.bits(),
+                0,
+                0,
+                Flags::USER_CODE64.bits(),
+                0,
+                0
+            ]
+        );
+        assert_eq!(gdt.entries().len(), 8);
+    }
+
+    #[test]
+    pub fn set_system_segment() {
+        let mut gdt = make_empty_gdt();
+        let tss = gdt.set(6, Descriptor::tss_segment(&TSS));
+        assert_eq!(tss, SegmentSelector::new(6, PrivilegeLevel::Ring0));
+        let Descriptor::SystemSegment(low, high) = Descriptor::tss_segment(&TSS) else {
+            unreachable!()
+        };
+        assert_eq!(gdt.entries()[6].raw(), low);
+        assert_eq!(gdt.entries()[7].raw(), high);
+        assert_eq!(gdt.entries().len(), 8);
+    }
+
+    #[test]
+    pub fn set_at_compile_time() {
+        static GDT: GlobalDescriptorTable<4> = {
+            let mut gdt = GlobalDescriptorTable::from_raw_entries(&[0; 4]);
+            gdt.set(1, Descriptor::kernel_code_segment());
+            gdt
+        };
+        assert_eq!(GDT.entries()[1].raw(), Flags::KERNEL_CODE64.bits());
+        assert_eq!(GDT.limit(), 4 * 8 - 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot overwrite the null descriptor")]
+    pub fn set_null_descriptor() {
+        make_empty_gdt().set(0, Descriptor::kernel_code_segment());
+    }
+
+    #[test]
+    #[should_panic(expected = "descriptor does not fit in the GDT")]
+    pub fn set_past_the_end() {
+        make_empty_gdt().set(8, Descriptor::kernel_data_segment());
+    }
+
+    #[test]
+    #[should_panic(expected = "descriptor does not fit in the GDT")]
+    pub fn set_system_segment_in_last_slot() {
+        make_empty_gdt().set(7, Descriptor::tss_segment(&TSS));
+    }
+
+    #[test]
+    #[cfg(all(feature = "instructions", target_arch = "x86_64"))]
+    pub fn store_matches_set() {
+        let mut set = make_empty_gdt();
+        set.set(1, Descriptor::kernel_code_segment());
+        set.set(4, Descriptor::tss_segment(&TSS));
+        let stored = make_empty_gdt();
+        // SAFETY: the table is not loaded.
+        let (code, tss) = unsafe {
+            (
+                stored.store(1, Descriptor::kernel_code_segment()),
+                stored.store(4, Descriptor::tss_segment(&TSS)),
+            )
+        };
+        assert_eq!(code, SegmentSelector::new(1, PrivilegeLevel::Ring0));
+        assert_eq!(tss, SegmentSelector::new(4, PrivilegeLevel::Ring0));
+        assert_eq!(set.entries(), stored.entries());
+    }
+
+    #[test]
+    #[should_panic(expected = "descriptor does not fit in the GDT")]
+    #[cfg(all(feature = "instructions", target_arch = "x86_64"))]
+    pub fn store_past_the_end() {
+        // SAFETY: the table is not loaded.
+        unsafe { make_empty_gdt().store(8, Descriptor::kernel_data_segment()) };
     }
 
     #[test]

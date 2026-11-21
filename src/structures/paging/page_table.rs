@@ -36,6 +36,15 @@ pub enum FrameError {
 /// needed, e.g. [`Ordering::Release`] to publish a new table to other CPUs,
 /// use the atomic operations such as [`load`](Self::load) and
 /// [`store`](Self::store), which work on the raw value.
+///
+/// Methods that take `&mut self` need exclusive access, so they are for entries
+/// that are private or that you hold the lock on. Methods that take `&self`
+/// work through shared access and are the ones to use on a live entry.
+///
+/// Because the value is read atomically, [`bits`](Self::bits),
+/// [`is_unused`](Self::is_unused) and [`flags`](Self::flags) are not `const`.
+/// [`new`](Self::new), [`from_bits`](Self::from_bits) and [`PageTable::new`]
+/// are, so static and const tables still work.
 #[repr(transparent)]
 pub struct PageTableEntry(AtomicU64);
 
@@ -361,6 +370,9 @@ const ENTRY_COUNT: usize = 512;
 ///
 /// This struct implements the `Index` and `IndexMut` traits, so the entries can be accessed
 /// through index operations. For example, `page_table[15]` returns the 16th page table entry.
+///
+/// The entries are [`PageTableEntry`]s and are stored atomically, so a table that the CPU can
+/// walk can be shared with it. See [`PageTableEntry`] for which access to use.
 ///
 /// Note that while this type implements [`Clone`], the users must be careful not to introduce
 /// mutable aliasing by using the cloned page tables.

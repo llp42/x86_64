@@ -571,3 +571,117 @@ pub trait CleanUp {
     ) where
         D: FrameDeallocator<Size4KiB>;
 }
+
+#[cfg(all(test, target_pointer_width = "64"))]
+mod mapper_tests {
+    use core::cell::RefCell;
+    use std::rc::Rc;
+
+    use super::*;
+    use crate::structures::paging::PageTable;
+
+    /// A frame mapping backed by a list of boxed page tables.
+    #[derive(Clone)]
+    struct TestMapping {
+        tables: Rc<RefCell<Vec<(u64, *mut PageTable)>>>,
+    }
+
+    // SAFETY: every frame handed out by `TestAllocator` is a live page table
+    // recorded in `tables`.
+    unsafe impl PageTableFrameMapping for TestMapping {
+        fn frame_to_pointer(&self, frame: PhysFrame) -> *mut PageTable {
+            self.tables
+                .borrow()
+                .iter()
+                .find(|(addr, _)| *addr == frame.start_address().as_u64())
+                .map(|(_, ptr)| *ptr)
+                .expect("test frame is not mapped")
+        }
+    }
+
+    /// Hands out boxed page tables as fresh frames.
+    struct TestAllocator {
+        frames: Vec<PhysFrame>,
+        tables: Vec<*mut PageTable>,
+    }
+
+    impl TestAllocator {
+        fn new(count: usize, tables: &Rc<RefCell<Vec<(u64, *mut PageTable)>>>) -> Self {
+            let mut frames = Vec::new();
+            let mut owned = Vec::new();
+            for _ in 0..count {
+                let table = Box::into_raw(Box::new(PageTable::new()));
+                tables.borrow_mut().push((table as u64, table));
+                frames.push(PhysFrame::containing_address(PhysAddr::new(table as u64)));
+                owned.push(table);
+            }
+            Self {
+                frames,
+                tables: owned,
+            }
+        }
+    }
+
+    impl Drop for TestAllocator {
+        fn drop(&mut self) {
+            for table in self.tables.drain(..) {
+                // SAFETY: each pointer comes from `Box::into_raw` and is freed once.
+                unsafe { drop(Box::from_raw(table)) };
+            }
+        }
+    }
+
+    // SAFETY: every returned frame is a page table that is not used anywhere else.
+    unsafe impl FrameAllocator<Size4KiB> for TestAllocator {
+        fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
+            self.frames.pop()
+        }
+    }
+
+    #[test]
+    fn mapped_page_table_maps_and_translates() {
+        let tables = Rc::new(RefCell::new(Vec::new()));
+        let mut allocator = TestAllocator::new(8, &tables);
+        let level_4 = Box::into_raw(Box::new(PageTable::new()));
+        tables.borrow_mut().push((level_4 as u64, level_4));
+        let mapping = TestMapping {
+            tables: Rc::clone(&tables),
+        };
+
+        // SAFETY: `level_4` is a valid level 4 table and `mapping` resolves the
+        // frames `allocator` hands out.
+        let mut mapper: MappedPageTable<'_, TestMapping> =
+            unsafe { MappedPageTable::new(&mut *level_4, mapping) };
+
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(0x1000_0000));
+        let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(0x2000));
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        // SAFETY: the page is unmapped and the frame is free.
+        let _flush = unsafe { mapper.map_to(page, frame, flags, &mut allocator) }.unwrap();
+
+        match mapper.translate(page.start_address()) {
+            TranslateResult::Mapped {
+                frame: MappedFrame::Size4KiB(translated),
+                offset,
+                flags: translated_flags,
+            } => {
+                assert_eq!(translated, frame);
+                assert_eq!(offset, 0);
+                assert!(translated_flags.contains(PageTableFlags::PRESENT));
+            }
+            other => panic!("unexpected translation: {:?}", other),
+        }
+
+        let (unmapped, unmapped_flags, _flush) = mapper.unmap(page).unwrap();
+        assert_eq!(unmapped, frame);
+        assert!(unmapped_flags.contains(PageTableFlags::PRESENT));
+        assert!(matches!(
+            mapper.translate(page.start_address()),
+            TranslateResult::NotMapped
+        ));
+
+        drop(mapper);
+        // SAFETY: created by `Box::into_raw` above and not freed elsewhere.
+        unsafe { drop(Box::from_raw(level_4)) };
+    }
+}

@@ -39,6 +39,26 @@ impl PageTableEntry {
         PageTableEntry { entry: 0 }
     }
 
+    /// Returns the raw 64-bit value of this entry.
+    ///
+    /// Every 64-bit value is a valid `PageTableEntry` representation. Reserved
+    /// bits are rejected by the hardware when a present entry is used, not when
+    /// the entry is built.
+    #[inline]
+    pub const fn bits(&self) -> u64 {
+        self.entry
+    }
+
+    /// Creates an entry from its raw 64-bit value.
+    ///
+    /// Every 64-bit value is a valid `PageTableEntry` representation. Reserved
+    /// bits are rejected by the hardware when a present entry is used, not when
+    /// the entry is built.
+    #[inline]
+    pub const fn from_bits(bits: u64) -> Self {
+        PageTableEntry { entry: bits }
+    }
+
     /// Returns whether this entry is zero.
     #[inline]
     pub const fn is_unused(&self) -> bool {
@@ -505,6 +525,20 @@ impl PageTableLevel {
     /// Returns the alignment for the address space described by an entry in a table of this level.
     pub const fn entry_address_space_alignment(self) -> u64 {
         1u64 << (((self as u8 - 1) * 9) + 12)
+    }
+}
+
+#[cfg(test)]
+mod entry_tests {
+    use super::*;
+
+    #[test]
+    fn page_table_entry_bits_roundtrip() {
+        let bits = 0x0000_0000_0000_1001;
+        let entry = PageTableEntry::from_bits(bits);
+        assert_eq!(entry.bits(), bits);
+        assert_eq!(PageTableEntry::new().bits(), 0);
+        assert!(PageTableEntry::new().is_unused());
     }
 }
 

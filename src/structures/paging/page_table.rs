@@ -4,8 +4,7 @@ use core::fmt;
 #[cfg(feature = "step_trait")]
 use core::iter::Step;
 use core::ops::{Index, IndexMut};
-#[cfg(feature = "memory_encryption")]
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::{PageSize, PhysFrame, Size4KiB};
 use crate::addr::PhysAddr;
@@ -13,7 +12,6 @@ use crate::addr::PhysAddr;
 use crate::structures::mem_encrypt::PHYSICAL_ADDRESS_MASK;
 
 use bitflags::bitflags;
-use const_fn::const_fn;
 
 /// The error returned by the `PageTableEntry::frame` method.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -26,27 +24,69 @@ pub enum FrameError {
 }
 
 /// A 64-bit page table entry.
-#[derive(Clone)]
+///
+/// The raw value is stored in an `AtomicU64` because the CPU updates the
+/// `ACCESSED` and `DIRTY` bits of live entries on its own, without any software
+/// instruction, and other CPUs may walk the same tables. An atomic access is
+/// what keeps those hardware updates well-defined; a plain `u64` would race
+/// with them.
+///
+/// The accessors and setters here use [`Ordering::Relaxed`], which is enough
+/// for the hardware's accessed/dirty updates.
 #[repr(transparent)]
-pub struct PageTableEntry {
-    entry: u64,
+pub struct PageTableEntry(AtomicU64);
+
+#[inline(always)]
+#[cfg(not(feature = "memory_encryption"))]
+const fn physical_address_mask() -> u64 {
+    0x000f_ffff_ffff_f000
+}
+
+#[inline(always)]
+#[cfg(feature = "memory_encryption")]
+fn physical_address_mask() -> u64 {
+    PHYSICAL_ADDRESS_MASK.load(Ordering::Relaxed) & !0xfff
+}
+
+#[inline]
+fn flags_from_bits(bits: u64) -> PageTableFlags {
+    PageTableFlags::from_bits_retain(bits & !physical_address_mask())
+}
+
+#[inline]
+fn addr_from_bits(bits: u64) -> PhysAddr {
+    PhysAddr::new(bits & physical_address_mask())
+}
+
+#[inline]
+fn frame_from_bits(bits: u64, is_level_1_entry: bool) -> Result<PhysFrame, FrameError> {
+    let flags = flags_from_bits(bits);
+    if !flags.contains(PageTableFlags::PRESENT) {
+        Err(FrameError::FrameNotPresent)
+    } else if !is_level_1_entry && flags.contains(PageTableFlags::HUGE_PAGE) {
+        Err(FrameError::HugeFrame)
+    } else {
+        Ok(PhysFrame::containing_address(addr_from_bits(bits)))
+    }
 }
 
 impl PageTableEntry {
     /// Creates an unused page table entry.
     #[inline]
     pub const fn new() -> Self {
-        PageTableEntry { entry: 0 }
+        Self(AtomicU64::new(0))
     }
 
     /// Returns the raw 64-bit value of this entry.
+    ///
+    /// This uses [`Ordering::Relaxed`].
     ///
     /// Every 64-bit value is a valid `PageTableEntry` representation. Reserved
     /// bits are rejected by the hardware when a present entry is used, not when
     /// the entry is built.
     #[inline]
-    pub const fn bits(&self) -> u64 {
-        self.entry
+    pub fn bits(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
     }
 
     /// Creates an entry from its raw 64-bit value.
@@ -56,32 +96,47 @@ impl PageTableEntry {
     /// the entry is built.
     #[inline]
     pub const fn from_bits(bits: u64) -> Self {
-        PageTableEntry { entry: bits }
+        Self(AtomicU64::new(bits))
+    }
+
+    /// Sets the raw 64-bit value of this entry.
+    ///
+    /// This uses [`Ordering::Relaxed`].
+    #[inline]
+    pub fn set_bits(&mut self, bits: u64) {
+        self.0.store(bits, Ordering::Relaxed);
     }
 
     /// Returns whether this entry is zero.
+    ///
+    /// This uses [`Ordering::Relaxed`].
     #[inline]
-    pub const fn is_unused(&self) -> bool {
-        self.entry == 0
+    pub fn is_unused(&self) -> bool {
+        self.bits() == 0
     }
 
     /// Sets this entry to zero.
+    ///
+    /// This uses [`Ordering::Relaxed`].
     #[inline]
     pub fn set_unused(&mut self) {
-        self.entry = 0;
+        self.set_bits(0);
     }
 
     /// Returns the flags of this entry.
+    ///
+    /// This uses [`Ordering::Relaxed`].
     #[inline]
-    #[const_fn(cfg(not(feature = "memory_encryption")))]
-    pub const fn flags(&self) -> PageTableFlags {
-        PageTableFlags::from_bits_retain(self.entry & !Self::physical_address_mask())
+    pub fn flags(&self) -> PageTableFlags {
+        flags_from_bits(self.bits())
     }
 
     /// Returns the physical address mapped by this entry, might be zero.
+    ///
+    /// This uses [`Ordering::Relaxed`].
     #[inline]
     pub fn addr(&self) -> PhysAddr {
-        PhysAddr::new(self.entry & Self::physical_address_mask())
+        addr_from_bits(self.bits())
     }
 
     /// Returns the physical frame mapped by this entry.
@@ -94,46 +149,45 @@ impl PageTableEntry {
     /// - `FrameError::FrameNotPresent` if the entry doesn't have the `PRESENT` flag set.
     /// - `FrameError::HugeFrame` if the entry has the `HUGE_PAGE` flag set (for huge pages the
     ///   `addr` function must be used) and `is_level_1_entry` is `false`
+    ///
+    /// This uses [`Ordering::Relaxed`].
     #[inline]
     pub fn frame(&self, is_level_1_entry: bool) -> Result<PhysFrame, FrameError> {
-        if !self.flags().contains(PageTableFlags::PRESENT) {
-            Err(FrameError::FrameNotPresent)
-        } else if !is_level_1_entry && self.flags().contains(PageTableFlags::HUGE_PAGE) {
-            Err(FrameError::HugeFrame)
-        } else {
-            Ok(PhysFrame::containing_address(self.addr()))
-        }
+        frame_from_bits(self.bits(), is_level_1_entry)
     }
 
     /// Map the entry to the specified physical address with the specified flags.
+    ///
+    /// This uses [`Ordering::Relaxed`].
     #[inline]
     pub fn set_addr(&mut self, addr: PhysAddr, flags: PageTableFlags) {
         assert!(addr.is_aligned(Size4KiB::SIZE));
-        self.entry = (addr.as_u64()) | flags.bits();
+        self.set_bits(addr.as_u64() | flags.bits());
     }
 
     /// Map the entry to the specified physical frame with the specified flags.
+    ///
+    /// This uses [`Ordering::Relaxed`].
     #[inline]
     pub fn set_frame(&mut self, frame: PhysFrame, flags: PageTableFlags) {
-        self.set_addr(frame.start_address(), flags)
+        self.set_addr(frame.start_address(), flags);
     }
 
     /// Sets the flags of this entry.
+    ///
+    /// This is a relaxed load followed by a relaxed store, so it can overwrite
+    /// an `ACCESSED` or `DIRTY` bit the CPU set in between. Use it only when the
+    /// entry is not being updated concurrently.
     #[inline]
     pub fn set_flags(&mut self, flags: PageTableFlags) {
-        self.entry = self.addr().as_u64() | flags.bits();
+        self.set_bits(addr_from_bits(self.bits()).as_u64() | flags.bits());
     }
+}
 
-    #[inline(always)]
-    #[cfg(not(feature = "memory_encryption"))]
-    const fn physical_address_mask() -> u64 {
-        0x000f_ffff_ffff_f000
-    }
-
-    #[inline(always)]
-    #[cfg(feature = "memory_encryption")]
-    fn physical_address_mask() -> u64 {
-        PHYSICAL_ADDRESS_MASK.load(Ordering::Relaxed) & !0xfff
+impl Clone for PageTableEntry {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self::from_bits(self.bits())
     }
 }
 
@@ -247,9 +301,8 @@ impl PageTable {
     /// Creates an empty page table.
     #[inline]
     pub const fn new() -> Self {
-        const EMPTY: PageTableEntry = PageTableEntry::new();
         PageTable {
-            entries: [EMPTY; ENTRY_COUNT],
+            entries: [const { PageTableEntry::new() }; ENTRY_COUNT],
         }
     }
 
@@ -539,6 +592,85 @@ mod entry_tests {
         assert_eq!(entry.bits(), bits);
         assert_eq!(PageTableEntry::new().bits(), 0);
         assert!(PageTableEntry::new().is_unused());
+    }
+
+    #[test]
+    fn page_table_entry_accessors() {
+        let mut entry = PageTableEntry::new();
+        assert!(entry.is_unused());
+
+        entry.set_addr(
+            PhysAddr::new(0x1000),
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        );
+        assert!(!entry.is_unused());
+        assert_eq!(entry.addr(), PhysAddr::new(0x1000));
+        assert!(entry.flags().contains(PageTableFlags::PRESENT));
+        assert!(entry.flags().contains(PageTableFlags::WRITABLE));
+
+        entry.set_frame(
+            PhysFrame::containing_address(PhysAddr::new(0x2000)),
+            PageTableFlags::PRESENT,
+        );
+        assert_eq!(entry.addr(), PhysAddr::new(0x2000));
+        assert_eq!(
+            entry.frame(true).unwrap(),
+            PhysFrame::containing_address(PhysAddr::new(0x2000))
+        );
+        assert!(!entry.flags().contains(PageTableFlags::WRITABLE));
+
+        entry.set_flags(PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE);
+        assert_eq!(entry.addr(), PhysAddr::new(0x2000));
+        assert!(entry.flags().contains(PageTableFlags::NO_EXECUTE));
+
+        entry.set_unused();
+        assert!(entry.is_unused());
+        assert_eq!(entry.bits(), 0);
+    }
+
+    #[test]
+    fn page_table_entry_frame_errors() {
+        let mut entry = PageTableEntry::new();
+        assert_eq!(entry.frame(true), Err(FrameError::FrameNotPresent));
+
+        entry.set_addr(
+            PhysAddr::new(0x1000),
+            PageTableFlags::PRESENT | PageTableFlags::HUGE_PAGE,
+        );
+        assert_eq!(entry.frame(false), Err(FrameError::HugeFrame));
+        assert!(entry.frame(true).is_ok());
+    }
+
+    #[test]
+    fn page_table_entry_clone_takes_a_snapshot() {
+        let mut entry = PageTableEntry::from_bits(0x1001);
+        let snapshot = entry.clone();
+        entry.set_unused();
+        assert_eq!(snapshot.bits(), 0x1001);
+        assert_eq!(entry.bits(), 0);
+    }
+
+    #[test]
+    fn page_table_api() {
+        assert_eq!(core::mem::size_of::<PageTableEntry>(), 8);
+        assert_eq!(core::mem::size_of::<PageTable>(), 4096);
+        assert_eq!(core::mem::align_of::<PageTable>(), 4096);
+
+        let mut table = PageTable::new();
+        assert!(table.is_empty());
+
+        table[0].set_addr(PhysAddr::new(0x1000), PageTableFlags::PRESENT);
+        assert!(!table.is_empty());
+        assert_eq!(table[0].addr(), PhysAddr::new(0x1000));
+
+        table[PageTableIndex::new(1)].set_addr(PhysAddr::new(0x2000), PageTableFlags::PRESENT);
+        assert_eq!(table.iter().filter(|entry| !entry.is_unused()).count(), 2);
+
+        table.zero();
+        assert!(table.is_empty());
+
+        let cloned = table.clone();
+        assert!(cloned.is_empty());
     }
 }
 

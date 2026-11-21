@@ -194,7 +194,7 @@ impl PageTableEntry {
     /// This uses [`Ordering::Relaxed`].
     #[inline]
     pub fn is_unused(&self) -> bool {
-        self.bits() == 0
+        self.0.load(Ordering::Relaxed) == 0
     }
 
     /// Sets this entry to zero.
@@ -202,7 +202,7 @@ impl PageTableEntry {
     /// This uses [`Ordering::Relaxed`].
     #[inline]
     pub fn set_unused(&mut self) {
-        self.set_bits(0);
+        self.0.store(0, Ordering::Relaxed);
     }
 
     /// Returns the flags of this entry.
@@ -210,7 +210,7 @@ impl PageTableEntry {
     /// This uses [`Ordering::Relaxed`].
     #[inline]
     pub fn flags(&self) -> PageTableFlags {
-        flags_from_bits(self.bits())
+        flags_from_bits(self.0.load(Ordering::Relaxed))
     }
 
     /// Returns the physical address mapped by this entry, might be zero.
@@ -218,7 +218,7 @@ impl PageTableEntry {
     /// This uses [`Ordering::Relaxed`].
     #[inline]
     pub fn addr(&self) -> PhysAddr {
-        addr_from_bits(self.bits())
+        addr_from_bits(self.0.load(Ordering::Relaxed))
     }
 
     /// Returns the physical frame mapped by this entry.
@@ -235,7 +235,7 @@ impl PageTableEntry {
     /// This uses [`Ordering::Relaxed`].
     #[inline]
     pub fn frame(&self, is_level_1_entry: bool) -> Result<PhysFrame, FrameError> {
-        frame_from_bits(self.bits(), is_level_1_entry)
+        frame_from_bits(self.0.load(Ordering::Relaxed), is_level_1_entry)
     }
 
     /// Map the entry to the specified physical address with the specified flags.
@@ -244,7 +244,8 @@ impl PageTableEntry {
     #[inline]
     pub fn set_addr(&mut self, addr: PhysAddr, flags: PageTableFlags) {
         assert!(addr.is_aligned(Size4KiB::SIZE));
-        self.set_bits(addr.as_u64() | flags.bits());
+        self.0
+            .store(addr.as_u64() | flags.bits(), Ordering::Relaxed);
     }
 
     /// Map the entry to the specified physical frame with the specified flags.
@@ -263,7 +264,11 @@ impl PageTableEntry {
     /// [`fetch_or`](Self::fetch_or) or [`fetch_and`](Self::fetch_and).
     #[inline]
     pub fn set_flags(&mut self, flags: PageTableFlags) {
-        self.set_bits(addr_from_bits(self.bits()).as_u64() | flags.bits());
+        let bits = self.0.load(Ordering::Relaxed);
+        self.0.store(
+            addr_from_bits(bits).as_u64() | flags.bits(),
+            Ordering::Relaxed,
+        );
     }
 }
 

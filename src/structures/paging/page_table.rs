@@ -50,7 +50,7 @@ pub struct PageTableEntry(AtomicU64);
 
 #[inline(always)]
 #[cfg(not(feature = "memory_encryption"))]
-const fn physical_address_mask() -> u64 {
+fn physical_address_mask() -> u64 {
     0x000f_ffff_ffff_f000
 }
 

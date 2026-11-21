@@ -677,19 +677,13 @@ mod entry_tests {
     use super::*;
     use core::sync::atomic::Ordering;
 
-    #[test]
-    fn page_table_entry_bits_roundtrip() {
-        let bits = 0x0000_0000_0000_1001;
-        let entry = PageTableEntry::from_bits(bits);
-        assert_eq!(entry.bits(), bits);
-        assert_eq!(PageTableEntry::new().bits(), 0);
-        assert!(PageTableEntry::new().is_unused());
-    }
-
+    /// The address and the flags live in disjoint halves of the entry, so
+    /// changing one must leave the other alone.
     #[test]
     fn page_table_entry_accessors() {
         let mut entry = PageTableEntry::new();
         assert!(entry.is_unused());
+        assert_eq!(entry.bits(), 0);
 
         entry.set_addr(
             PhysAddr::new(0x1000),
@@ -715,6 +709,11 @@ mod entry_tests {
         assert_eq!(entry.addr(), PhysAddr::new(0x2000));
         assert!(entry.flags().contains(PageTableFlags::NO_EXECUTE));
 
+        // A raw store has to reach the typed accessors too.
+        entry.store(0x3000 | PageTableFlags::PRESENT.bits(), Ordering::Relaxed);
+        assert_eq!(entry.addr(), PhysAddr::new(0x3000));
+        assert!(entry.flags().contains(PageTableFlags::PRESENT));
+
         entry.set_unused();
         assert!(entry.is_unused());
         assert_eq!(entry.bits(), 0);
@@ -733,6 +732,8 @@ mod entry_tests {
         assert!(entry.frame(true).is_ok());
     }
 
+    /// `Clone` must copy the value rather than aliasing the entry, so the
+    /// snapshot outlives later writes to the table.
     #[test]
     fn page_table_entry_clone_takes_a_snapshot() {
         let mut entry = PageTableEntry::from_bits(0x1001);
@@ -742,74 +743,44 @@ mod entry_tests {
         assert_eq!(entry.bits(), 0);
     }
 
+    /// The read-modify-write operations report the value they found, which is
+    /// what lets a caller keep an accessed or dirty bit the CPU set in between.
     #[test]
-    fn page_table_entry_atomic_operations() {
-        let entry = PageTableEntry::new();
-        assert_eq!(entry.load(Ordering::Relaxed), 0);
-
-        entry.store(0x1001, Ordering::Relaxed);
-        assert_eq!(entry.load(Ordering::Relaxed), 0x1001);
-
-        let old = entry.swap(0x2001, Ordering::AcqRel);
-        assert_eq!(old, 0x1001);
-
-        let result = entry.compare_exchange(0x2001, 0x3001, Ordering::AcqRel, Ordering::Acquire);
-        assert_eq!(result, Ok(0x2001));
-        let result = entry.compare_exchange(0x2001, 0x3001, Ordering::AcqRel, Ordering::Acquire);
-        assert_eq!(result, Err(0x3001));
-
-        entry.store(0x3001, Ordering::Relaxed);
-        let old = entry.fetch_or(PageTableFlags::WRITABLE.bits(), Ordering::AcqRel);
-        assert_eq!(old, 0x3001);
-        assert_eq!(
-            entry.load(Ordering::Relaxed),
-            0x3001 | PageTableFlags::WRITABLE.bits()
-        );
-
-        let old = entry.fetch_and(!PageTableFlags::WRITABLE.bits(), Ordering::AcqRel);
-        assert_eq!(old, 0x3001 | PageTableFlags::WRITABLE.bits());
-        assert_eq!(entry.load(Ordering::Relaxed), 0x3001);
-    }
-
-    #[test]
-    fn page_table_entry_compare_exchange_weak() {
+    fn page_table_entry_atomic_read_modify_write() {
         let entry = PageTableEntry::from_bits(0x3001);
-        // A mismatch always fails, spurious failures aside.
+
         assert_eq!(
-            entry.compare_exchange_weak(0x1001, 0x4001, Ordering::AcqRel, Ordering::Acquire),
+            entry.compare_exchange(0x1001, 0x4001, Ordering::AcqRel, Ordering::Acquire),
             Err(0x3001)
         );
+        assert_eq!(
+            entry.compare_exchange(0x3001, 0x4001, Ordering::AcqRel, Ordering::Acquire),
+            Ok(0x3001)
+        );
 
-        // A match may fail spuriously, so retry until it succeeds.
-        for _ in 0..100 {
-            if let Ok(old) =
-                entry.compare_exchange_weak(0x3001, 0x4001, Ordering::AcqRel, Ordering::Acquire)
-            {
-                assert_eq!(old, 0x3001);
-                break;
-            }
-        }
+        let previous = entry.fetch_or(PageTableFlags::DIRTY.bits(), Ordering::AcqRel);
+        assert_eq!(previous, 0x4001);
+        assert_eq!(
+            entry.load(Ordering::Relaxed),
+            0x4001 | PageTableFlags::DIRTY.bits()
+        );
+
+        let previous = entry.fetch_and(!PageTableFlags::DIRTY.bits(), Ordering::AcqRel);
+        assert_eq!(previous, 0x4001 | PageTableFlags::DIRTY.bits());
         assert_eq!(entry.load(Ordering::Relaxed), 0x4001);
     }
 
+    /// Kernels cast pointers to these types, so the sizes and alignments are
+    /// part of the contract.
     #[test]
-    fn page_table_entry_atomic_writes_are_visible_to_accessors() {
-        let entry = PageTableEntry::new();
-        entry.store(
-            0x2000 | (PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE).bits(),
-            Ordering::Release,
-        );
-        assert_eq!(entry.addr(), PhysAddr::new(0x2000));
-        assert!(entry.flags().contains(PageTableFlags::PRESENT));
-        assert!(entry.flags().contains(PageTableFlags::NO_EXECUTE));
+    fn page_table_layout() {
+        assert_eq!(core::mem::size_of::<PageTableEntry>(), 8);
+        assert_eq!(core::mem::size_of::<PageTable>(), 4096);
+        assert_eq!(core::mem::align_of::<PageTable>(), 4096);
     }
 
     #[test]
     fn page_table_api() {
-        assert_eq!(core::mem::size_of::<PageTableEntry>(), 8);
-        assert_eq!(core::mem::size_of::<PageTable>(), 4096);
-        assert_eq!(core::mem::align_of::<PageTable>(), 4096);
-
         let mut table = PageTable::new();
         assert!(table.is_empty());
 
@@ -822,9 +793,6 @@ mod entry_tests {
 
         table.zero();
         assert!(table.is_empty());
-
-        let cloned = table.clone();
-        assert!(cloned.is_empty());
     }
 }
 

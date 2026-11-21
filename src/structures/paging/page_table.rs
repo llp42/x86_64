@@ -32,7 +32,10 @@ pub enum FrameError {
 /// with them.
 ///
 /// The accessors and setters here use [`Ordering::Relaxed`], which is enough
-/// for the hardware's accessed/dirty updates.
+/// for the hardware's accessed/dirty updates. When a stronger ordering is
+/// needed, e.g. [`Ordering::Release`] to publish a new table to other CPUs,
+/// use the atomic operations such as [`load`](Self::load) and
+/// [`store`](Self::store), which work on the raw value.
 #[repr(transparent)]
 pub struct PageTableEntry(AtomicU64);
 
@@ -107,6 +110,76 @@ impl PageTableEntry {
         self.0.store(bits, Ordering::Relaxed);
     }
 
+    /// Loads the raw 64-bit value of this entry with the given ordering.
+    #[inline]
+    pub fn load(&self, order: Ordering) -> u64 {
+        self.0.load(order)
+    }
+
+    /// Stores a raw 64-bit value with the given ordering.
+    #[inline]
+    pub fn store(&self, bits: u64, order: Ordering) {
+        self.0.store(bits, order);
+    }
+
+    /// Stores a raw 64-bit value and returns the previous one.
+    #[inline]
+    pub fn swap(&self, bits: u64, order: Ordering) -> u64 {
+        self.0.swap(bits, order)
+    }
+
+    /// Compares the raw value against `current` and replaces it with `new` if
+    /// they are equal.
+    ///
+    /// Returns the previous raw value on success, and the current one on
+    /// failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `failure` is [`Ordering::Release`] or [`Ordering::AcqRel`].
+    #[inline]
+    pub fn compare_exchange(
+        &self,
+        current: u64,
+        new: u64,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<u64, u64> {
+        self.0.compare_exchange(current, new, success, failure)
+    }
+
+    /// Compares the raw value against `current` and replaces it with `new` if
+    /// they are equal, allowing spurious failures.
+    ///
+    /// Returns the previous raw value on success, and the current one on
+    /// failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `failure` is [`Ordering::Release`] or [`Ordering::AcqRel`].
+    #[inline]
+    pub fn compare_exchange_weak(
+        &self,
+        current: u64,
+        new: u64,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<u64, u64> {
+        self.0.compare_exchange_weak(current, new, success, failure)
+    }
+
+    /// Bitwise ANDs the raw value with `bits` and returns the previous one.
+    #[inline]
+    pub fn fetch_and(&self, bits: u64, order: Ordering) -> u64 {
+        self.0.fetch_and(bits, order)
+    }
+
+    /// Bitwise ORs the raw value with `bits` and returns the previous one.
+    #[inline]
+    pub fn fetch_or(&self, bits: u64, order: Ordering) -> u64 {
+        self.0.fetch_or(bits, order)
+    }
+
     /// Returns whether this entry is zero.
     ///
     /// This uses [`Ordering::Relaxed`].
@@ -177,7 +250,8 @@ impl PageTableEntry {
     ///
     /// This is a relaxed load followed by a relaxed store, so it can overwrite
     /// an `ACCESSED` or `DIRTY` bit the CPU set in between. Use it only when the
-    /// entry is not being updated concurrently.
+    /// entry is not being updated concurrently; otherwise use
+    /// [`fetch_or`](Self::fetch_or) or [`fetch_and`](Self::fetch_and).
     #[inline]
     pub fn set_flags(&mut self, flags: PageTableFlags) {
         self.set_bits(addr_from_bits(self.bits()).as_u64() | flags.bits());
@@ -584,6 +658,7 @@ impl PageTableLevel {
 #[cfg(test)]
 mod entry_tests {
     use super::*;
+    use core::sync::atomic::Ordering;
 
     #[test]
     fn page_table_entry_bits_roundtrip() {
@@ -648,6 +723,68 @@ mod entry_tests {
         entry.set_unused();
         assert_eq!(snapshot.bits(), 0x1001);
         assert_eq!(entry.bits(), 0);
+    }
+
+    #[test]
+    fn page_table_entry_atomic_operations() {
+        let entry = PageTableEntry::new();
+        assert_eq!(entry.load(Ordering::Relaxed), 0);
+
+        entry.store(0x1001, Ordering::Relaxed);
+        assert_eq!(entry.load(Ordering::Relaxed), 0x1001);
+
+        let old = entry.swap(0x2001, Ordering::AcqRel);
+        assert_eq!(old, 0x1001);
+
+        let result = entry.compare_exchange(0x2001, 0x3001, Ordering::AcqRel, Ordering::Acquire);
+        assert_eq!(result, Ok(0x2001));
+        let result = entry.compare_exchange(0x2001, 0x3001, Ordering::AcqRel, Ordering::Acquire);
+        assert_eq!(result, Err(0x3001));
+
+        entry.store(0x3001, Ordering::Relaxed);
+        let old = entry.fetch_or(PageTableFlags::WRITABLE.bits(), Ordering::AcqRel);
+        assert_eq!(old, 0x3001);
+        assert_eq!(
+            entry.load(Ordering::Relaxed),
+            0x3001 | PageTableFlags::WRITABLE.bits()
+        );
+
+        let old = entry.fetch_and(!PageTableFlags::WRITABLE.bits(), Ordering::AcqRel);
+        assert_eq!(old, 0x3001 | PageTableFlags::WRITABLE.bits());
+        assert_eq!(entry.load(Ordering::Relaxed), 0x3001);
+    }
+
+    #[test]
+    fn page_table_entry_compare_exchange_weak() {
+        let entry = PageTableEntry::from_bits(0x3001);
+        // A mismatch always fails, spurious failures aside.
+        assert_eq!(
+            entry.compare_exchange_weak(0x1001, 0x4001, Ordering::AcqRel, Ordering::Acquire),
+            Err(0x3001)
+        );
+
+        // A match may fail spuriously, so retry until it succeeds.
+        for _ in 0..100 {
+            if let Ok(old) =
+                entry.compare_exchange_weak(0x3001, 0x4001, Ordering::AcqRel, Ordering::Acquire)
+            {
+                assert_eq!(old, 0x3001);
+                break;
+            }
+        }
+        assert_eq!(entry.load(Ordering::Relaxed), 0x4001);
+    }
+
+    #[test]
+    fn page_table_entry_atomic_writes_are_visible_to_accessors() {
+        let entry = PageTableEntry::new();
+        entry.store(
+            0x2000 | (PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE).bits(),
+            Ordering::Release,
+        );
+        assert_eq!(entry.addr(), PhysAddr::new(0x2000));
+        assert!(entry.flags().contains(PageTableFlags::PRESENT));
+        assert!(entry.flags().contains(PageTableFlags::NO_EXECUTE));
     }
 
     #[test]
